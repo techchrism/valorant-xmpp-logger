@@ -1,4 +1,5 @@
 # Valorant XMPP Logger
+A simple tool to log XMPP traffic between the Riot client and the Riot XMPP server. Includes information such as presences and chat.
 
 *Heavily* based on [Burak](https://github.com/BurakDev)'s [riot-xmpp-mitm](https://github.com/ValorantDevelopers/riot-xmpp-mitm) project.
 
@@ -6,8 +7,7 @@
 Note: This project makes use of global fetch in Node 18+
  - Clone the repo and run `npm install`
  - Run `npm run build` to build the project
- - Run `node .` to start the logger
- - From the folder containing RiotClientServices, run `./RiotClientServices.exe --client-config-url="http://127.0.0.1:35479" --launch-product=valorant --launch-patchline=live`
+ - Ensure Valorant is not running and run `node .` to start the logger. This will start Valorant automatically.
 
 ## Log Format
 The first line of the file must contain a json-encoded object with required properties
@@ -23,3 +23,4 @@ Log entries are json-encoded objects with the following properties:
 While [an excellent xmpp mitm project](https://github.com/ValorantDevelopers/riot-xmpp-mitm) had already been created,
 I wanted to try my hand at creating a similar project to better understand MITM-ing the Riot client config.
 This project also writes logs to disk in an easily parsable format, which is useful for creating tools to analyze the logs.
+Finally, this project automatically finds and starts the Riot client which is convenient.

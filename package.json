@@ -1,7 +1,7 @@
 {
   "name": "valorant-xmpp-logger",
   "version": "1.0.0",
-  "description": "",
+  "description": "A simple tool to log XMPP traffic between the Riot client and the Riot XMPP server",
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc",
