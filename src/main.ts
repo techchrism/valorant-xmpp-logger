@@ -26,7 +26,7 @@ import {exec} from 'node:child_process'
     // Log header format
     logStream.write(JSON.stringify({
         type: 'valorant-xmpp-logger',
-        version: '1.0.0'
+        version: '1.1.0'
     }) + '\n')
 
     const configMitm = new ConfigMITM(httpPort, host, xmppPort)

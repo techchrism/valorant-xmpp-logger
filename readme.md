@@ -15,9 +15,24 @@ The first line of the file must contain a json-encoded object with required prop
 
 Following lines are either comments (to be ignored by parsers) starting with `#` or log entries.
 Log entries are json-encoded objects with the following properties:
- - `type`: `incoming` for incoming data, `outgoing` for outgoing data
+ - `type`:
+   - `incoming` for incoming data
+   - `outgoing` for outgoing data
+   - `open-valorant` when Valorant initiates an XMPP socket connection to this application
+   - `open-riot` when this application initiates an XMPP socket connection to the Riot XMPP server (in response to `open-valorant`)
+   - `close-valorant` when Valorant closes the XMPP socket connection
+   - `close-riot` when this the Riot XMPP server closes the XMPP socket connection
  - `time`: timestamp of the log entry
+
+If the type is `incoming` or `outgoing`, the following properties are also present:
  - `data`: the data that was sent or received
+
+If the type is `open-*` or `close-*`, the following properties are also present:
+ - `socketID`: A unique ID for the socket connection. Internally implemented as a counter.
+
+If the type is `open-valorant`, the following properties are also present:
+ - `host`: the hostname of the Riot XMPP server that the connection is intended for
+ - `port`: the port of the Riot XMPP server that the connection is intended for
 
 ## Motivation
 While [an excellent xmpp mitm project](https://github.com/ValorantDevelopers/riot-xmpp-mitm) had already been created,
