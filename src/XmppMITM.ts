@@ -80,6 +80,10 @@ export class XmppMITM {
                     }) + '\n')
                 })
 
+                riotTLS.on('error', error => {
+                    console.error('Riot TLS error:', error)
+                })
+
                 socket.on('data', data => {
                     this._logStream.write(JSON.stringify({
                         type: 'outgoing',
@@ -100,6 +104,10 @@ export class XmppMITM {
                         socketID: currentSocketID
                     }) + '\n')
                     console.log(`Disconnected from ${mapping.riotHost}:${mapping.riotPort}`)
+                })
+
+                socket.on('error', error => {
+                    console.error('Valorant TLS error:', error)
                 })
             }).listen(this._port, () => {resolve()})
         })
