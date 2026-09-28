@@ -1,115 +1,143 @@
 import * as tls from 'node:tls'
-import {ConfigMITM} from './ConfigMITM'
-import * as fs from 'node:fs'
+import { isIP } from 'node:net'
+import { ConfigMITM } from './ConfigMITM'
+import { Writable } from 'node:stream'
 
 export class XmppMITM {
-    private readonly _port: number
-    private readonly _host: string
-    private readonly _configMitm: ConfigMITM
-    private readonly _logStream: fs.WriteStream
-    private _socketID = 0
+	private _socketID = 0
+	private _server?: tls.Server
+	private readonly sockets = new Set<tls.TLSSocket>()
 
-    constructor(port: number, host: string, configMitm: ConfigMITM, logStream: fs.WriteStream) {
-        this._port = port
-        this._host = host
-        this._configMitm = configMitm
-        this._logStream = logStream
-    }
+	constructor(
+		private readonly _port: number,
+		private readonly _host: string,
+		private readonly _configMitm: ConfigMITM,
+		private readonly _logStream: Writable,
+		private readonly _tlsOptions: tls.TlsOptions
+	) {}
 
-    async start() {
-        return new Promise<void>(async (resolve) => {
-            tls.createServer({
-                key: await fs.promises.readFile('./certs/server.key'),
-                cert: await fs.promises.readFile('./certs/server.cert'),
-                rejectUnauthorized: false,
-                requestCert: false
-            }, socket => {
-                const ipv4LocalHost = socket.localAddress?.replace('::ffff:', '')
-                const mapping = this._configMitm.affinityMappings.find(mapping => mapping.localHost === ipv4LocalHost)
-                if(mapping === undefined) {
-                    console.log(`Unknown host ${socket.localAddress}`)
-                    socket.destroy()
-                    return
-                }
+	private log(type: string, fields: Record<string, unknown> = {}) {
+		this._logStream.write(
+			JSON.stringify({ type, time: Date.now(), ...fields }) + '\n'
+		)
+	}
 
-                this._socketID++
-                const currentSocketID = this._socketID
+	async start() {
+		this._server = tls.createServer(
+			{ ...this._tlsOptions, requestCert: false },
+			socket => {
+				const target = this._configMitm.target
 
-                console.log(`Connecting to ${mapping.riotHost}:${mapping.riotPort}...`)
-                this._logStream.write(JSON.stringify({
-                    type: 'open-valorant',
-                    time: Date.now(),
-                    host: mapping.riotHost,
-                    port: mapping.riotPort,
-                    socketID: currentSocketID
-                }) + '\n')
+				if (!target) {
+					console.error('TLS accepted, but no Riot chat route is available yet')
+					socket.destroy()
+					return
+				}
 
-                let preConnectBuffer = Buffer.alloc(0)
+				const socketID = ++this._socketID
 
-                const riotTLS = tls.connect({
-                    host: mapping.riotHost,
-                    port: mapping.riotPort,
-                    rejectUnauthorized: false,
-                    requestCert: false
-                }, () => {
-                    if(preConnectBuffer.length > 0) {
-                        riotTLS.write(preConnectBuffer)
-                        preConnectBuffer = Buffer.alloc(0)
-                    }
-                    this._logStream.write(JSON.stringify({
-                        type: 'open-riot',
-                        time: Date.now(),
-                        socketID: currentSocketID
-                    }) + '\n')
-                })
+				this.log('open-valorant', {
+					host: target.riotHost,
+					port: target.riotPort,
+					socketID
+				})
 
-                riotTLS.on('data', data => {
-                    this._logStream.write(JSON.stringify({
-                        type: 'incoming',
-                        time: Date.now(),
-                        data: data.toString()
-                    }) + '\n')
-                    socket.write(data)
-                })
+				console.log(
+					'Client TLS accepted; connecting to ' +
+						target.riotHost +
+						':' +
+						target.riotPort +
+						'...'
+				)
 
-                riotTLS.on('close', () => {
-                    this._logStream.write(JSON.stringify({
-                        type: 'close-riot',
-                        time: Date.now(),
-                        socketID: currentSocketID
-                    }) + '\n')
-                })
+				socket.pause()
 
-                riotTLS.on('error', error => {
-                    console.error('Riot TLS error:', error)
-                })
+				const upstream = tls.connect({
+					host: target.riotHost,
+					port: target.riotPort,
+					servername: isIP(target.riotHost) ? undefined : target.riotHost,
+					rejectUnauthorized: true
+				})
 
-                socket.on('data', data => {
-                    this._logStream.write(JSON.stringify({
-                        type: 'outgoing',
-                        time: Date.now(),
-                        data: data.toString()
-                    }) + '\n')
-                    if(riotTLS.connecting) {
-                        preConnectBuffer = Buffer.concat([preConnectBuffer, data])
-                    } else {
-                        riotTLS.write(data)
-                    }
-                })
+				this.sockets.add(upstream)
 
-                socket.on('close', () => {
-                    this._logStream.write(JSON.stringify({
-                        type: 'close-valorant',
-                        time: Date.now(),
-                        socketID: currentSocketID
-                    }) + '\n')
-                    console.log(`Disconnected from ${mapping.riotHost}:${mapping.riotPort}`)
-                })
+				const timer = setTimeout(
+					() => upstream.destroy(new Error('Riot TLS handshake timed out')),
+					15000
+				)
 
-                socket.on('error', error => {
-                    console.error('Valorant TLS error:', error)
-                })
-            }).listen(this._port, () => {resolve()})
-        })
-    }
+				upstream.once('secureConnect', () => {
+					clearTimeout(timer)
+					this.log('open-riot', { socketID })
+					console.log('Riot TLS connected; forwarding XMPP')
+
+					socket.on('data', data =>
+						this.log('outgoing', { data: data.toString(), socketID })
+					)
+
+					upstream.on('data', data =>
+						this.log('incoming', { data: data.toString(), socketID })
+					)
+
+					socket.pipe(upstream)
+					upstream.pipe(socket)
+				})
+				for (const [name, current, other] of [
+					['valorant', socket, upstream],
+					['riot', upstream, socket]
+				] as const) {
+					current.on('error', error =>
+						console.error(name + ' TLS error: ' + error.message)
+					)
+
+					current.once('close', () => {
+						clearTimeout(timer)
+						this.sockets.delete(current)
+						this.log('close-' + name, { socketID })
+						other.destroy()
+					})
+				}
+			}
+		)
+		this._server.on('connection', socket => {
+			console.log(
+				'TCP connection from ' + socket.remoteAddress + '; waiting for TLS'
+			)
+		})
+
+		this._server.on('secureConnection', socket => {
+			this.sockets.add(socket)
+			socket.once('close', () => this.sockets.delete(socket))
+		})
+
+		this._server.on('tlsClientError', (error, socket) => {
+			console.error(
+				'Client TLS handshake failed: ' +
+					error.message +
+					'. Check certificate hostname, expiry and trust.'
+			)
+
+			this._logStream.write(
+				'# Client TLS handshake failed: ' +
+					error.message.replace(/[\r\n]/g, ' ') +
+					'\n'
+			)
+
+			socket.destroy()
+		})
+
+		await new Promise<void>((resolve, reject) => {
+			this._server!.once('error', reject)
+			this._server!.listen(this._port, this._host, resolve)
+		})
+	}
+
+	async stop() {
+		for (const socket of this.sockets) socket.destroy()
+
+		await new Promise<void>((resolve, reject) => {
+			if (!this._server?.listening) return resolve()
+			this._server.close(error => (error ? reject(error) : resolve()))
+		})
+	}
 }
