@@ -1,88 +1,144 @@
 import * as http from 'node:http'
-import {HeadersInit} from 'undici'
 
-interface PlayerConfigAffinities {
-    'chat.affinities': {
-        [key: string]: string
-    }
-    'chat.host': string
-    'chat.port': number
-    'chat.allow_bad_cert.enabled': boolean
+export interface ChatTarget {
+	riotHost: string
+	riotPort: number
 }
 
 export class ConfigMITM {
-    private readonly _port: number
-    private readonly _host: string
-    private readonly _xmppPort: number
-    private _server: http.Server | null = null
-    private _affinityMappingID = 0
-    public affinityMappings: {
-        localHost: string,
-        riotHost: string,
-        riotPort: number
-    }[] = []
+	private _server: http.Server | null = null
+	public target: ChatTarget | undefined
 
-    constructor(port: number, host: string, xmppPort: number) {
-        this._port = port
-        this._host = host
-        this._xmppPort = xmppPort
-    }
+	constructor(
+		private readonly _port: number,
+		private readonly _host: string,
+		private readonly _xmppPort: number,
+		private readonly _chatHost: string
+	) {}
 
-    async start() {
-        this._server = http.createServer(async (req, res) => {
-            const now = Date.now()
-            console.log(`Request: ${now} ${req.method} ${req.url}`)
+	async rewriteConfig(data: Record<string, unknown>, authorization?: string) {
+		const affinities = data['chat.affinities'] as
+			Record<string, string> | undefined
+		const port = data['chat.port']
+		let host = data['chat.host']
+		if (typeof port !== 'number' || port < 1 || port > 65535) return data
+		if (affinities && data['chat.affinity.enabled'] === true && authorization) {
+			const response = await fetch(
+				'https://riot-geo.pas.si.riotgames.com/pas/v1/service/chat',
+				{
+					headers: { authorization },
+					signal: AbortSignal.timeout(15000)
+				}
+			)
+			if (!response.ok)
+				throw new Error('Chat affinity lookup returned HTTP ' + response.status)
+			const token = await response.text()
+			const payload = JSON.parse(
+				Buffer.from(token.split('.')[1], 'base64url').toString()
+			)
+			const selected = affinities[payload.affinity]
+			if (typeof selected !== 'string' || !selected)
+				throw new Error('No chat server for player affinity')
+			host = selected
+		}
+		if (typeof host !== 'string' || !host) return data
+		this.target = { riotHost: host, riotPort: port }
+		data['chat.host'] = this._chatHost
+		data['chat.port'] = this._xmppPort
+		data['chat.allow_bad_cert.enabled'] = false
+		if (affinities) {
+			data['chat.affinities'] = Object.fromEntries(
+				Object.keys(affinities).map(region => [region, this._chatHost])
+			)
+		}
+		console.log(
+			'Chat route: ' +
+				this._chatHost +
+				':' +
+				this._xmppPort +
+				' -> ' +
+				host +
+				':' +
+				port
+		)
+		return data
+	}
 
-            const proxiedHeaders = new Headers(req.headers as HeadersInit)
-            proxiedHeaders.delete('host')
+	async start() {
+		this._server = http.createServer(async (req, res) => {
+			try {
+				if (req.method !== 'GET' && req.method !== 'HEAD') {
+					res.writeHead(405).end()
+					return
+				}
+				const headers = new Headers()
+				for (const name of [
+					'user-agent',
+					'authorization',
+					'x-riot-entitlements-jwt',
+					'accept'
+				]) {
+					const value = req.headers[name]
+					if (typeof value === 'string') headers.set(name, value)
+				}
+				// Never forward conditional-cache headers: a 304 would bypass rewriting.
+				const response = await fetch(
+					'https://clientconfig.rpg.riotgames.com' + req.url,
+					{
+						method: req.method,
+						headers,
+						signal: AbortSignal.timeout(15000)
+					}
+				)
+				let body = await response.text()
+				if (response.ok && req.method === 'GET') {
+					let data: unknown
+					try {
+						data = JSON.parse(body)
+					} catch {
+						/* Forward non-JSON unchanged. */
+					}
+					if (data && typeof data === 'object' && !Array.isArray(data)) {
+						body = JSON.stringify(
+							await this.rewriteConfig(
+								data as Record<string, unknown>,
+								req.headers.authorization
+							)
+						)
+					}
+				}
+				console.log(
+					'Config: ' +
+						req.method +
+						' ' +
+						req.url?.split('?')[0] +
+						' -> ' +
+						response.status
+				)
+				res.writeHead(response.status, {
+					'content-type':
+						response.headers.get('content-type') || 'application/json',
+					'cache-control': 'no-store'
+				})
+				res.end(body)
+			} catch (error) {
+				console.error(
+					'Config proxy failed:',
+					error instanceof Error ? error.message : 'Unknown error'
+				)
+				res.writeHead(502).end('Configuration proxy failed; see logger console')
+			}
+		})
+		await new Promise<void>((resolve, reject) => {
+			this._server!.once('error', reject)
+			this._server!.listen(this._port, this._host, resolve)
+		})
+	}
 
-            const response = await fetch(`https://clientconfig.rpg.riotgames.com${req.url}`, {
-                method: req.method,
-                headers: proxiedHeaders
-            })
-            const text = await response.text()
-
-            res.writeHead(response.status)
-            if(req.url?.startsWith('/api/v1/config/player') && response.status === 200) {
-                // Rewrite affinity data
-                const data = JSON.parse(text) satisfies PlayerConfigAffinities
-                if(data.hasOwnProperty('chat.affinities')) {
-                    for(const [region, ip] of Object.entries(data['chat.affinities'])) {
-                        const existingMapping = this.affinityMappings.find(mapping => mapping.riotHost === ip)
-                        if(existingMapping !== undefined) {
-                            data['chat.affinities'][region] = existingMapping.localHost
-                        } else {
-                            const newMapping = {
-                                localHost: `127.0.0.${++this._affinityMappingID}`,
-                                riotHost: ip as string,
-                                riotPort: data['chat.port']
-                            }
-                            this.affinityMappings.push(newMapping)
-                            data['chat.affinities'][region] = newMapping.localHost
-                        }
-                    }
-                    data['chat.port'] = this._xmppPort
-                    data['chat.host'] = this._host
-                    data['chat.allow_bad_cert.enabled'] = true
-                }
-                res.write(JSON.stringify(data))
-            } else {
-                res.write(text)
-            }
-            res.end()
-        })
-        return new Promise<void>((resolve, reject) => {
-            this._server?.listen(this._port, this._host, () => {
-                resolve()
-            })
-        })
-    }
-
-    async stop() {
-        return new Promise<void>((resolve, reject) => {
-            this._server?.close(() => {
-                resolve()
-            })
-        })
-    }
+	async stop() {
+		await new Promise<void>((resolve, reject) => {
+			if (!this._server?.listening) return resolve()
+			this._server.close(error => (error ? reject(error) : resolve()))
+		})
+	}
 }
